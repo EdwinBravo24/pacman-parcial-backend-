@@ -1,9 +1,8 @@
 const express = require("express")
-const http = require("http")
+const { createServer } = require("http")
 const { Server } = require("socket.io")
 const mongoose = require("mongoose")
 const cors = require("cors")
-const path = require("path")
 require("dotenv").config()
 
 // Import routes
@@ -11,15 +10,12 @@ const leaderboardRoutes = require("./routes/leaderboard")
 
 // Initialize Express app
 const app = express()
-const server = http.createServer(app)
+const server = createServer(app)
 
 // Configure CORS for production
 const corsOptions = {
-  origin:
-    process.env.NODE_ENV === "production"
-      ? [process.env.FRONTEND_URL, "https://*.vercel.app"]
-      : ["http://localhost:5173", "http://localhost:3000"],
-  methods: ["GET", "POST"],
+  origin: true, // Allow all origins for now
+  methods: ["GET", "POST", "PUT", "DELETE"],
   credentials: true,
 }
 
@@ -29,17 +25,18 @@ app.use(express.json())
 // Health check endpoint
 app.get("/", (req, res) => {
   res.json({
-    message: "Pac-Man Multiplayer Backend is running!",
+    message: "🎮 Pac-Man Multiplayer Backend is running!",
     status: "healthy",
     timestamp: new Date().toISOString(),
     environment: process.env.NODE_ENV || "development",
+    version: "1.0.0",
   })
 })
 
 // API routes
 app.use("/api/leaderboard", leaderboardRoutes)
 
-// Initialize Socket.IO with proper CORS
+// Initialize Socket.IO
 const io = new Server(server, {
   cors: corsOptions,
   transports: ["websocket", "polling"],
@@ -71,16 +68,12 @@ const connectedBridges = new Set()
 // Connect to MongoDB
 const connectDB = async () => {
   try {
-    if (!process.env.MONGODB_URI) {
+    if (process.env.MONGODB_URI) {
+      await mongoose.connect(process.env.MONGODB_URI)
+      console.log("✅ MongoDB connected")
+    } else {
       console.log("⚠️ MongoDB URI not provided, using in-memory storage")
-      return
     }
-
-    await mongoose.connect(process.env.MONGODB_URI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-    })
-    console.log("✅ MongoDB connected")
   } catch (err) {
     console.error("❌ MongoDB connection error:", err)
     console.log("⚠️ Continuing without database...")
@@ -101,12 +94,11 @@ io.on("connection", (socket) => {
 
   // Handle Arduino bridge registration
   socket.on("register-arduino-bridge", (data) => {
-    console.log("🌉 Arduino Bridge connected:", socket.id, data)
+    console.log("🌉 Arduino Bridge connected:", socket.id)
     socket.isBridge = true
     connectedBridges.add(socket.id)
     arduinoConnected = true
 
-    // Notify all clients
     io.emit("arduino-status", {
       connected: true,
       bridge: true,
@@ -114,28 +106,16 @@ io.on("connection", (socket) => {
     })
   })
 
-  // Handle bridge heartbeat
-  socket.on("bridge-heartbeat", (data) => {
-    console.log("💓 Bridge heartbeat from:", socket.id)
-  })
-
   // Handle Arduino input from bridge
   socket.on("arduino-input", (input) => {
     console.log("🎮 Arduino input received:", input)
-
-    // Update player 1 direction
     updatePlayerDirection(gameState.player1, input)
-
-    // Broadcast to all clients
     io.emit("arduino-input", input)
     io.emit("game-update", gameState)
   })
 
   // Handle player input
   socket.on("player-input", ({ player, input }) => {
-    console.log(`🎮 Player ${player} input:`, input)
-
-    // Update player direction based on input
     if (player === 1) {
       updatePlayerDirection(gameState.player1, input)
     } else if (player === 2) {
@@ -146,27 +126,19 @@ io.on("connection", (socket) => {
   // Handle game start
   socket.on("start-game", ({ player1Name, player2Name }) => {
     console.log(`🎮 Starting game: ${player1Name} vs ${player2Name}`)
-
-    // Reset game state
     resetGameState()
-
-    // Store player names
     gameState.player1.name = player1Name
     gameState.player2.name = player2Name
 
-    // Start game loop
     if (!gameLoopInterval) {
       startGameLoop()
     }
 
-    // Broadcast game start
     io.emit("game-started", { player1Name, player2Name })
   })
 
-  // Manual Arduino control via WebSocket (for testing)
+  // Manual Arduino control
   socket.on("arduino-manual-press", (direction) => {
-    console.log("🔘 Manual Arduino press:", direction)
-
     const input = { up: false, down: false, left: false, right: false }
 
     switch (direction.toUpperCase()) {
@@ -184,7 +156,6 @@ io.on("connection", (socket) => {
         break
     }
 
-    // Update player 1 and broadcast
     updatePlayerDirection(gameState.player1, input)
     io.emit("arduino-input", input)
     io.emit("game-update", gameState)
@@ -200,19 +171,16 @@ io.on("connection", (socket) => {
         arduinoConnected = false
       }
 
-      // Notify all clients
       io.emit("arduino-status", {
         connected: connectedBridges.size > 0,
         bridge: connectedBridges.size > 0,
         bridges: connectedBridges.size,
       })
-    } else {
-      console.log("👤 Client disconnected:", socket.id)
     }
   })
 })
 
-// Update player direction based on input
+// Game functions
 function updatePlayerDirection(player, input) {
   if (input.up) player.direction = "up"
   else if (input.down) player.direction = "down"
@@ -220,84 +188,56 @@ function updatePlayerDirection(player, input) {
   else if (input.right) player.direction = "right"
 }
 
-// Game loop
 let gameLoopInterval = null
 
 function startGameLoop() {
-  if (gameLoopInterval) {
-    clearInterval(gameLoopInterval)
-  }
+  if (gameLoopInterval) clearInterval(gameLoopInterval)
 
   gameLoopInterval = setInterval(() => {
-    // Update invulnerability timers
     updateInvulnerability()
-
-    // Update power mode
     updatePowerMode()
-
-    // Move players
     movePlayer(gameState.player1)
     movePlayer(gameState.player2)
-
-    // Move ghosts with improved AI
     moveGhosts()
-
-    // Check collisions (including ghost collisions)
     checkCollisions()
-
-    // Check game over conditions
     checkGameOver()
-
-    // Send updated game state to all clients
     io.emit("game-update", gameState)
 
-    // If game is over, stop the game loop
     if (gameState.gameOver) {
       clearInterval(gameLoopInterval)
       gameLoopInterval = null
-
-      // Save scores to database
       saveScores()
     }
-  }, 150) // Game speed
+  }, 150)
 }
 
-// Update invulnerability timers
 function updateInvulnerability() {
   const currentTime = Date.now()
 
-  // Player 1 invulnerability
   if (gameState.player1.invulnerable && currentTime - gameState.player1.invulnerableTime > 3000) {
     gameState.player1.invulnerable = false
   }
 
-  // Player 2 invulnerability
   if (gameState.player2.invulnerable && currentTime - gameState.player2.invulnerableTime > 3000) {
     gameState.player2.invulnerable = false
   }
 }
 
-// Update power mode
 function updatePowerMode() {
   if (gameState.powerMode) {
     const currentTime = Date.now()
     if (currentTime - gameState.powerModeTime > 10000) {
       gameState.powerMode = false
-
-      // Reset ghost colors
       gameState.ghosts.forEach((ghost) => {
-        if (ghost.color === "blue") {
-          if (ghost.originalColor) {
-            ghost.color = ghost.originalColor
-            delete ghost.originalColor
-          }
+        if (ghost.color === "blue" && ghost.originalColor) {
+          ghost.color = ghost.originalColor
+          delete ghost.originalColor
         }
       })
     }
   }
 }
 
-// Reset game state
 function resetGameState() {
   gameState = {
     player1: { x: 1, y: 1, direction: "right", score: 0, lives: 5, invulnerable: false, invulnerableTime: 0, name: "" },
@@ -316,7 +256,7 @@ function resetGameState() {
     powerModeTime: 0,
   }
 
-  // Initialize dots and power pellets
+  // Initialize maze
   const MAZE_LAYOUT = [
     [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
     [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
@@ -362,7 +302,6 @@ function resetGameState() {
   }
 }
 
-// Move player
 function movePlayer(player) {
   const MAZE_LAYOUT = [
     [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
@@ -416,7 +355,7 @@ function movePlayer(player) {
       break
   }
 
-  // Handle tunnel (left-right wrap around)
+  // Handle tunnel
   if (newX < 0) newX = 27
   if (newX > 27) newX = 0
 
@@ -433,49 +372,44 @@ function movePlayer(player) {
   }
 }
 
-// Move ghosts with improved AI
 function moveGhosts() {
   gameState.ghosts.forEach((ghost, index) => {
-    // Choose target based on ghost behavior
     let target = null
 
     if (gameState.powerMode) {
-      // During power mode, ghosts run away from players
+      // Run away from players
       const player1Distance = Math.abs(ghost.x - gameState.player1.x) + Math.abs(ghost.y - gameState.player1.y)
       const player2Distance = Math.abs(ghost.x - gameState.player2.x) + Math.abs(ghost.y - gameState.player2.y)
 
       if (player1Distance < player2Distance) {
-        // Run away from player 1
         target = {
           x: ghost.x + (ghost.x - gameState.player1.x),
           y: ghost.y + (ghost.y - gameState.player1.y),
         }
       } else {
-        // Run away from player 2
         target = {
           x: ghost.x + (ghost.x - gameState.player2.x),
           y: ghost.y + (ghost.y - gameState.player2.y),
         }
       }
     } else {
-      // Normal mode: each ghost targets a different player or has different behavior
+      // Target players
       switch (index) {
-        case 0: // Red ghost - always targets player 1
+        case 0:
           target = { x: gameState.player1.x, y: gameState.player1.y }
           break
-        case 1: // Pink ghost - targets player 2
+        case 1:
           target = { x: gameState.player2.x, y: gameState.player2.y }
           break
-        case 2: // Cyan ghost - targets the player with higher score
+        case 2:
           if (gameState.player1.score >= gameState.player2.score) {
             target = { x: gameState.player1.x, y: gameState.player1.y }
           } else {
             target = { x: gameState.player2.x, y: gameState.player2.y }
           }
           break
-        case 3: // Orange ghost - random movement with occasional targeting
+        case 3:
           if (Math.random() < 0.3) {
-            // 30% chance to target nearest player
             const player1Distance = Math.abs(ghost.x - gameState.player1.x) + Math.abs(ghost.y - gameState.player1.y)
             const player2Distance = Math.abs(ghost.x - gameState.player2.x) + Math.abs(ghost.y - gameState.player2.y)
 
@@ -489,18 +423,14 @@ function moveGhosts() {
       }
     }
 
-    // Move towards or away from target
     let newX = ghost.x
     let newY = ghost.y
 
     if (target) {
-      // Calculate direction to target
       const deltaX = target.x - ghost.x
       const deltaY = target.y - ghost.y
 
-      // Choose primary direction based on largest delta
       if (Math.abs(deltaX) > Math.abs(deltaY)) {
-        // Move horizontally
         if (deltaX > 0) {
           newX++
           ghost.direction = "right"
@@ -509,7 +439,6 @@ function moveGhosts() {
           ghost.direction = "left"
         }
       } else {
-        // Move vertically
         if (deltaY > 0) {
           newY++
           ghost.direction = "down"
@@ -521,8 +450,7 @@ function moveGhosts() {
     } else {
       // Random movement
       const directions = ["up", "down", "left", "right"]
-      const randomDirection = directions[Math.floor(Math.random() * directions.length)]
-      ghost.direction = randomDirection
+      ghost.direction = directions[Math.floor(Math.random() * directions.length)]
 
       switch (ghost.direction) {
         case "up":
@@ -540,11 +468,11 @@ function moveGhosts() {
       }
     }
 
-    // Handle tunnel (left-right wrap around)
+    // Handle tunnel
     if (newX < 0) newX = 27
     if (newX > 27) newX = 0
 
-    // Simple bounds checking for ghosts (they can move through ghost house)
+    // Simple bounds checking
     if (newX >= 0 && newX < 28 && newY >= 0 && newY < 31) {
       ghost.x = newX
       ghost.y = newY
@@ -552,7 +480,6 @@ function moveGhosts() {
   })
 }
 
-// Check collisions
 function checkCollisions() {
   // Check dot collection
   gameState.dots = gameState.dots.filter((dot) => {
@@ -566,9 +493,9 @@ function checkCollisions() {
       if (dot.x === gameState.player2.x && dot.y === gameState.player2.y) {
         gameState.player2.score += 10
       }
-      return false // Remove dot
+      return false
     }
-    return true // Keep dot
+    return true
   })
 
   // Check power pellet collection
@@ -584,11 +511,9 @@ function checkCollisions() {
         gameState.player2.score += 50
       }
 
-      // Activate power mode
       gameState.powerMode = true
       gameState.powerModeTime = Date.now()
 
-      // Turn ghosts blue
       gameState.ghosts.forEach((ghost) => {
         if (ghost.color !== "blue") {
           ghost.originalColor = ghost.color
@@ -596,63 +521,47 @@ function checkCollisions() {
         }
       })
 
-      return false // Remove power pellet
+      return false
     }
-    return true // Keep power pellet
+    return true
   })
 
   // Check ghost collisions
   gameState.ghosts.forEach((ghost, ghostIndex) => {
-    // Check collision with player 1
+    // Player 1 collision
     if (ghost.x === gameState.player1.x && ghost.y === gameState.player1.y) {
       if (gameState.powerMode) {
-        // Player can eat ghost during power mode
         gameState.player1.score += 200
-
-        // Respawn ghost at center
         ghost.x = 13 + (ghostIndex % 2)
         ghost.y = 14 + Math.floor(ghostIndex / 2)
-
-        // Restore original color
         if (ghost.originalColor) {
           ghost.color = ghost.originalColor
           delete ghost.originalColor
         }
       } else if (!gameState.player1.invulnerable) {
-        // Ghost kills player
         gameState.player1.lives--
         gameState.player1.invulnerable = true
         gameState.player1.invulnerableTime = Date.now()
-
-        // Respawn player at starting position
         gameState.player1.x = 1
         gameState.player1.y = 1
         gameState.player1.direction = "right"
       }
     }
 
-    // Check collision with player 2
+    // Player 2 collision
     if (ghost.x === gameState.player2.x && ghost.y === gameState.player2.y) {
       if (gameState.powerMode) {
-        // Player can eat ghost during power mode
         gameState.player2.score += 200
-
-        // Respawn ghost at center
         ghost.x = 13 + (ghostIndex % 2)
         ghost.y = 14 + Math.floor(ghostIndex / 2)
-
-        // Restore original color
         if (ghost.originalColor) {
           ghost.color = ghost.originalColor
           delete ghost.originalColor
         }
       } else if (!gameState.player2.invulnerable) {
-        // Ghost kills player
         gameState.player2.lives--
         gameState.player2.invulnerable = true
         gameState.player2.invulnerableTime = Date.now()
-
-        // Respawn player at starting position
         gameState.player2.x = 26
         gameState.player2.y = 1
         gameState.player2.direction = "left"
@@ -661,9 +570,8 @@ function checkCollisions() {
   })
 }
 
-// Check game over conditions
 function checkGameOver() {
-  // Check if all dots are collected
+  // All dots collected
   if (gameState.dots.length === 0 && gameState.powerPellets.length === 0) {
     gameState.gameOver = true
     if (gameState.player1.score > gameState.player2.score) {
@@ -671,11 +579,11 @@ function checkGameOver() {
     } else if (gameState.player2.score > gameState.player1.score) {
       gameState.winner = gameState.player2.name || "Player 2"
     } else {
-      gameState.winner = null // Tie
+      gameState.winner = null
     }
   }
 
-  // Check if both players are dead
+  // Both players dead
   if (gameState.player1.lives <= 0 && gameState.player2.lives <= 0) {
     gameState.gameOver = true
     if (gameState.player1.score > gameState.player2.score) {
@@ -683,11 +591,11 @@ function checkGameOver() {
     } else if (gameState.player2.score > gameState.player1.score) {
       gameState.winner = gameState.player2.name || "Player 2"
     } else {
-      gameState.winner = null // Tie
+      gameState.winner = null
     }
   }
 
-  // Check if one player is dead (the other wins)
+  // One player dead
   if (gameState.player1.lives <= 0 && gameState.player2.lives > 0) {
     gameState.gameOver = true
     gameState.winner = gameState.player2.name || "Player 2"
@@ -697,7 +605,6 @@ function checkGameOver() {
   }
 }
 
-// Save scores to database
 async function saveScores() {
   try {
     if (!mongoose.connection.readyState) {
@@ -707,7 +614,6 @@ async function saveScores() {
 
     const Score = require("./models/Score")
 
-    // Save player 1 score
     if (gameState.player1.name) {
       const score1 = new Score({
         playerName: gameState.player1.name,
@@ -717,7 +623,6 @@ async function saveScores() {
       await score1.save()
     }
 
-    // Save player 2 score
     if (gameState.player2.name) {
       const score2 = new Score({
         playerName: gameState.player2.name,
@@ -733,12 +638,12 @@ async function saveScores() {
   }
 }
 
-// API endpoint for manual Arduino control (useful for testing)
+// API endpoint for manual Arduino control
 app.post("/api/arduino/press", (req, res) => {
   const { direction } = req.body
 
   if (!direction || !["UP", "DOWN", "LEFT", "RIGHT"].includes(direction.toUpperCase())) {
-    return res.status(400).json({ error: "Invalid direction. Use UP, DOWN, LEFT, or RIGHT" })
+    return res.status(400).json({ error: "Invalid direction" })
   }
 
   const input = { up: false, down: false, left: false, right: false }
@@ -758,7 +663,6 @@ app.post("/api/arduino/press", (req, res) => {
       break
   }
 
-  // Update player 1 and broadcast
   updatePlayerDirection(gameState.player1, input)
   io.emit("arduino-input", input)
   io.emit("game-update", gameState)
@@ -769,12 +673,10 @@ app.post("/api/arduino/press", (req, res) => {
 // Export for Vercel
 module.exports = app
 
-// Start server (only if not in Vercel)
-if (process.env.NODE_ENV !== "production") {
+// Start server locally
+if (require.main === module) {
   const PORT = process.env.PORT || 3001
   server.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`)
-    console.log(`🎮 Pac-Man Multiplayer Game Server`)
-    console.log(`📡 WebSocket server ready`)
   })
 }
