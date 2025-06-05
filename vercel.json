@@ -1,16 +1,41 @@
 {
-    "version": 2,
-    "name": "softedubackmongodb",
-    "builds": [
-       { 
-        "src": "index.js", 
-        "use": "@vercel/node" 
+  "version": 2,
+  "builds": [
+    {
+      "src": "back/server.js",
+      "use": "@vercel/node",
+      "config": {
+        "maxLambdaSize": "50mb"
       }
-    ],
-    "routes": [
-       { 
-        "src": "/(.*)", 
-        "dest": "/index.js" 
+    },
+    {
+      "src": "front/package.json",
+      "use": "@vercel/static-build",
+      "config": {
+        "distDir": "dist"
       }
-    ]
+    }
+  ],
+  "routes": [
+    {
+      "src": "/api/(.*)",
+      "dest": "/back/server.js"
+    },
+    {
+      "src": "/socket.io/(.*)",
+      "dest": "/back/server.js"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/front/dist/$1"
+    }
+  ],
+  "env": {
+    "NODE_ENV": "production"
+  },
+  "functions": {
+    "back/server.js": {
+      "maxDuration": 30
+    }
   }
+}

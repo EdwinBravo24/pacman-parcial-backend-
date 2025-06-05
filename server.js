@@ -6,16 +6,6 @@ const cors = require("cors")
 const path = require("path")
 require("dotenv").config()
 
-// Conditional import of SerialPort (only if not in production without hardware)
-let SerialPort, ReadlineParser
-try {
-  const serialport = require("serialport")
-  SerialPort = serialport.SerialPort
-  ReadlineParser = require("@serialport/parser-readline").ReadlineParser
-} catch (err) {
-  console.log("SerialPort not available, using simulator mode")
-}
-
 // Import routes
 const leaderboardRoutes = require("./routes/leaderboard")
 
@@ -23,24 +13,37 @@ const leaderboardRoutes = require("./routes/leaderboard")
 const app = express()
 const server = http.createServer(app)
 
-// Configure CORS
-app.use(cors())
+// Configure CORS for production
+const corsOptions = {
+  origin:
+    process.env.NODE_ENV === "production"
+      ? [process.env.FRONTEND_URL, "https://*.vercel.app"]
+      : ["http://localhost:5173", "http://localhost:3000"],
+  methods: ["GET", "POST"],
+  credentials: true,
+}
+
+app.use(cors(corsOptions))
 app.use(express.json())
 
-// Serve static files from the React app in production
-if (process.env.NODE_ENV === "production") {
-  app.use(express.static(path.join(__dirname, "../front/dist")))
-}
+// Health check endpoint
+app.get("/", (req, res) => {
+  res.json({
+    message: "Pac-Man Multiplayer Backend is running!",
+    status: "healthy",
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || "development",
+  })
+})
 
 // API routes
 app.use("/api/leaderboard", leaderboardRoutes)
 
-// Initialize Socket.IO
+// Initialize Socket.IO with proper CORS
 const io = new Server(server, {
-  cors: {
-    origin: process.env.NODE_ENV === "production" ? false : ["http://localhost:5173"],
-    methods: ["GET", "POST"],
-  },
+  cors: corsOptions,
+  transports: ["websocket", "polling"],
+  allowEIO3: true,
 })
 
 // Game state
@@ -61,379 +64,77 @@ let gameState = {
   powerModeTime: 0,
 }
 
-// Arduino connection and simulation
-let arduinoPort = null
+// Arduino connection status
 let arduinoConnected = false
-let arduinoSimulator = null
-
-// Arduino Virtual Controller - Simulates Arduino LCD Keypad Shield
-class ArduinoSimulator {
-  constructor(io) {
-    this.io = io
-    this.isConnected = false
-    this.currentKey = null
-    this.lastKeyTime = 0
-    this.keyDelay = 100
-
-    // Virtual LCD state
-    this.lcdLine1 = "Pac-Man Player 1"
-    this.lcdLine2 = "Ready to play!"
-
-    console.log("🤖 Arduino Simulator initialized")
-    console.log("📱 Virtual LCD Keypad Shield ready")
-  }
-
-  connect() {
-    this.isConnected = true
-    console.log("✅ Arduino Simulator connected")
-    console.log("📺 LCD Display:")
-    console.log(`   Line 1: ${this.lcdLine1}`)
-    console.log(`   Line 2: ${this.lcdLine2}`)
-
-    this.io.emit("arduino-status", { connected: true })
-
-    // Send initial status
-    console.log("📤 ARDUINO:READY")
-
-    // Start virtual button simulation (for demo purposes)
-    this.startDemoMode()
-  }
-
-  disconnect() {
-    this.isConnected = false
-    console.log("❌ Arduino Simulator disconnected")
-    this.io.emit("arduino-status", { connected: false })
-  }
-
-  // Simulate LCD display update
-  updateLCD(line1, line2) {
-    this.lcdLine1 = line1
-    this.lcdLine2 = line2
-    console.log("📺 LCD Updated:")
-    console.log(`   Line 1: ${line1}`)
-    console.log(`   Line 2: ${line2}`)
-  }
-
-  // Simulate button press
-  pressButton(buttonName) {
-    if (!this.isConnected) return
-
-    const now = Date.now()
-    if (now - this.lastKeyTime < this.keyDelay) return
-
-    this.lastKeyTime = now
-    this.currentKey = buttonName
-
-    console.log(`🔘 Virtual button pressed: ${buttonName}`)
-
-    // Update virtual LCD
-    this.updateLCD("Button pressed:", `${buttonName} ->`)
-
-    // Send key press to game (same format as real Arduino)
-    console.log(`📤 KEY:${buttonName}`)
-
-    // Convert to game input
-    const input = { up: false, down: false, left: false, right: false }
-
-    switch (buttonName) {
-      case "UP":
-        input.up = true
-        break
-      case "DOWN":
-        input.down = true
-        break
-      case "LEFT":
-        input.left = true
-        break
-      case "RIGHT":
-        input.right = true
-        break
-    }
-
-    this.io.emit("arduino-input", input)
-
-    // Clear display after 2 seconds
-    setTimeout(() => {
-      this.updateLCD("Pac-Man Player 1", "Press any button")
-    }, 2000)
-  }
-
-  // Demo mode - simulates random button presses for testing
-  startDemoMode() {
-    if (process.env.ARDUINO_DEMO_MODE === "true") {
-      console.log("🎮 Demo mode activated - Random button presses every 3 seconds")
-
-      setInterval(() => {
-        const buttons = ["UP", "DOWN", "LEFT", "RIGHT"]
-        const randomButton = buttons[Math.floor(Math.random() * buttons.length)]
-        this.pressButton(randomButton)
-      }, 3000)
-    }
-  }
-
-  // API for manual control (useful for testing)
-  manualPress(direction) {
-    this.pressButton(direction.toUpperCase())
-  }
-}
-
-// Try to connect to Arduino (real hardware or simulator)
-function connectToArduino() {
-  // Check if we should use simulator
-  if (process.env.USE_ARDUINO_SIMULATOR === "true" || !SerialPort) {
-    console.log("🔄 Starting Arduino Simulator...")
-    arduinoSimulator = new ArduinoSimulator(io)
-    arduinoSimulator.connect()
-    arduinoConnected = true
-    return
-  }
-
-  // Try to connect to real Arduino
-  console.log("🔍 Searching for Arduino hardware...")
-
-  SerialPort.list()
-    .then((ports) => {
-      console.log("Available ports:")
-      ports.forEach((port) => {
-        console.log(
-          `  ${port.path} - ${port.manufacturer || "unknown"} - VID:${port.vendorId || "unknown"} PID:${port.productId || "unknown"}`,
-        )
-      })
-
-      let arduinoPortInfo = null
-
-      // 1. Try specified port first
-      if (process.env.ARDUINO_PORT) {
-        console.log(`🎯 Trying specified port: ${process.env.ARDUINO_PORT}`)
-        arduinoPortInfo = ports.find((port) => port.path === process.env.ARDUINO_PORT)
-
-        if (arduinoPortInfo) {
-          console.log(`✅ Found specified port: ${process.env.ARDUINO_PORT}`)
-        } else {
-          console.log(`❌ Specified port ${process.env.ARDUINO_PORT} not found`)
-        }
-      }
-
-      // 2. Auto-detect Arduino
-      if (!arduinoPortInfo) {
-        arduinoPortInfo = ports.find(
-          (port) =>
-            port.manufacturer &&
-            (port.manufacturer.toLowerCase().includes("arduino") ||
-              port.manufacturer.toLowerCase().includes("wch") ||
-              port.manufacturer.toLowerCase().includes("ftdi") ||
-              port.vendorId === "2341" || // Arduino VID
-              port.vendorId === "1A86"), // CH340 VID
-        )
-      }
-
-      // 3. Fallback to first available port
-      if (!arduinoPortInfo && ports.length > 0) {
-        console.log("⚠️  No Arduino detected, using first available port as fallback")
-        arduinoPortInfo = ports[0]
-      }
-
-      if (arduinoPortInfo) {
-        console.log(`🔌 Attempting connection to: ${arduinoPortInfo.path}`)
-
-        try {
-          arduinoPort = new SerialPort({
-            path: arduinoPortInfo.path,
-            baudRate: 9600,
-          })
-
-          const parser = arduinoPort.pipe(new ReadlineParser({ delimiter: "\r\n" }))
-
-          arduinoPort.on("open", () => {
-            console.log(`✅ Arduino connected on ${arduinoPortInfo.path}`)
-            console.log("🎮 Hardware controller ready!")
-            arduinoConnected = true
-            io.emit("arduino-status", { connected: true })
-          })
-
-          arduinoPort.on("error", (err) => {
-            console.error(`❌ Arduino error on ${arduinoPortInfo.path}:`, err.message)
-            console.log("🔄 Falling back to simulator mode...")
-
-            arduinoConnected = false
-            io.emit("arduino-status", { connected: false })
-
-            // Fallback to simulator
-            arduinoSimulator = new ArduinoSimulator(io)
-            arduinoSimulator.connect()
-            arduinoConnected = true
-          })
-
-          arduinoPort.on("close", () => {
-            console.log("🔌 Arduino hardware disconnected")
-            arduinoConnected = false
-            io.emit("arduino-status", { connected: false })
-
-            // Try to reconnect after a delay
-            setTimeout(connectToArduino, 5000)
-          })
-
-          // Parse Arduino input
-          parser.on("data", (data) => {
-            console.log(`📥 Arduino data: ${data}`)
-
-            // Handle Arduino ready signal
-            if (data.includes("ARDUINO:READY")) {
-              console.log("🎮 Arduino controller initialized")
-              return
-            }
-
-            // Parse button input: "KEY:UP", "KEY:DOWN", etc.
-            if (data.startsWith("KEY:")) {
-              const key = data.substring(4).trim()
-              console.log(`🔘 Hardware button pressed: ${key}`)
-
-              const input = { up: false, down: false, left: false, right: false }
-
-              switch (key) {
-                case "UP":
-                  input.up = true
-                  break
-                case "DOWN":
-                  input.down = true
-                  break
-                case "LEFT":
-                  input.left = true
-                  break
-                case "RIGHT":
-                  input.right = true
-                  break
-                // Añadir soporte para valores numéricos del LCD Keypad Shield
-                case "0":
-                case "RIGHT_VAL":
-                  input.right = true
-                  console.log("🎮 RIGHT button detected")
-                  break
-                case "1":
-                case "UP_VAL":
-                  input.up = true
-                  console.log("🎮 UP button detected")
-                  break
-                case "2":
-                case "DOWN_VAL":
-                  input.down = true
-                  console.log("🎮 DOWN button detected")
-                  break
-                case "3":
-                case "LEFT_VAL":
-                  input.left = true
-                  console.log("🎮 LEFT button detected")
-                  break
-                case "4":
-                case "SELECT_VAL":
-                  // Botón SELECT - podría usarse para pausa u otra función
-                  console.log("🎮 SELECT button detected")
-                  break
-              }
-
-              // Enviar el input a todos los clientes y actualizar el estado del juego inmediatamente
-              io.emit("arduino-input", input)
-
-              // Actualizar la dirección del jugador 1 directamente
-              updatePlayerDirection(gameState.player1, input)
-
-              // Enviar actualización del estado del juego
-              io.emit("game-update", gameState)
-            }
-
-            // Detectar valores analógicos directos (alternativa)
-            else if (!isNaN(data)) {
-              const analogValue = Number.parseInt(data.trim())
-              console.log(`📊 Analog value: ${analogValue}`)
-
-              const input = { up: false, down: false, left: false, right: false }
-
-              // Mapear valores analógicos a botones (ajustar según tu shield)
-              if (analogValue < 50) {
-                input.right = true
-                console.log("🎮 RIGHT button (analog)")
-              } else if (analogValue < 200) {
-                input.up = true
-                console.log("🎮 UP button (analog)")
-              } else if (analogValue < 400) {
-                input.down = true
-                console.log("🎮 DOWN button (analog)")
-              } else if (analogValue < 600) {
-                input.left = true
-                console.log("🎮 LEFT button (analog)")
-              } else if (analogValue < 800) {
-                // SELECT button
-                console.log("🎮 SELECT button (analog)")
-              }
-
-              if (input.up || input.down || input.left || input.right) {
-                io.emit("arduino-input", input)
-                updatePlayerDirection(gameState.player1, input)
-                io.emit("game-update", gameState)
-              }
-            }
-          })
-        } catch (err) {
-          console.error(`❌ Failed to connect to ${arduinoPortInfo.path}:`, err.message)
-          console.log("🔄 Starting simulator as fallback...")
-
-          // Fallback to simulator
-          arduinoSimulator = new ArduinoSimulator(io)
-          arduinoSimulator.connect()
-          arduinoConnected = true
-        }
-      } else {
-        console.log("❌ No serial ports found")
-        console.log("🔄 Starting Arduino Simulator...")
-
-        // Use simulator
-        arduinoSimulator = new ArduinoSimulator(io)
-        arduinoSimulator.connect()
-        arduinoConnected = true
-      }
-    })
-    .catch((err) => {
-      console.error("❌ Error listing serial ports:", err)
-      console.log("🔄 Starting Arduino Simulator as fallback...")
-
-      // Fallback to simulator
-      arduinoSimulator = new ArduinoSimulator(io)
-      arduinoSimulator.connect()
-      arduinoConnected = true
-    })
-}
-
-// API endpoint for manual Arduino control (useful for testing)
-app.post("/api/arduino/press", (req, res) => {
-  const { direction } = req.body
-
-  if (!direction || !["UP", "DOWN", "LEFT", "RIGHT"].includes(direction.toUpperCase())) {
-    return res.status(400).json({ error: "Invalid direction. Use UP, DOWN, LEFT, or RIGHT" })
-  }
-
-  if (arduinoSimulator) {
-    arduinoSimulator.manualPress(direction)
-    res.json({ success: true, message: `Button ${direction} pressed` })
-  } else {
-    res.status(503).json({ error: "Arduino simulator not available" })
-  }
-})
+const connectedBridges = new Set()
 
 // Connect to MongoDB
-mongoose
-  .connect(process.env.MONGODB_URI || "mongodb://localhost:27017/pacman")
-  .then(() => console.log("✅ MongoDB connected"))
-  .catch((err) => console.error("❌ MongoDB connection error:", err))
+const connectDB = async () => {
+  try {
+    if (!process.env.MONGODB_URI) {
+      console.log("⚠️ MongoDB URI not provided, using in-memory storage")
+      return
+    }
 
-// Socket.IO connection
+    await mongoose.connect(process.env.MONGODB_URI, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+    })
+    console.log("✅ MongoDB connected")
+  } catch (err) {
+    console.error("❌ MongoDB connection error:", err)
+    console.log("⚠️ Continuing without database...")
+  }
+}
+
+connectDB()
+
+// Socket.IO connection handling
 io.on("connection", (socket) => {
-  console.log("👤 New client connected")
+  console.log("👤 New client connected:", socket.id)
 
   // Send current Arduino status
-  socket.emit("arduino-status", { connected: arduinoConnected })
+  socket.emit("arduino-status", {
+    connected: arduinoConnected || connectedBridges.size > 0,
+    bridges: connectedBridges.size,
+  })
+
+  // Handle Arduino bridge registration
+  socket.on("register-arduino-bridge", (data) => {
+    console.log("🌉 Arduino Bridge connected:", socket.id, data)
+    socket.isBridge = true
+    connectedBridges.add(socket.id)
+    arduinoConnected = true
+
+    // Notify all clients
+    io.emit("arduino-status", {
+      connected: true,
+      bridge: true,
+      bridges: connectedBridges.size,
+    })
+  })
+
+  // Handle bridge heartbeat
+  socket.on("bridge-heartbeat", (data) => {
+    console.log("💓 Bridge heartbeat from:", socket.id)
+  })
+
+  // Handle Arduino input from bridge
+  socket.on("arduino-input", (input) => {
+    console.log("🎮 Arduino input received:", input)
+
+    // Update player 1 direction
+    updatePlayerDirection(gameState.player1, input)
+
+    // Broadcast to all clients
+    io.emit("arduino-input", input)
+    io.emit("game-update", gameState)
+  })
 
   // Handle player input
   socket.on("player-input", ({ player, input }) => {
+    console.log(`🎮 Player ${player} input:`, input)
+
     // Update player direction based on input
     if (player === 1) {
       updatePlayerDirection(gameState.player1, input)
@@ -457,17 +158,57 @@ io.on("connection", (socket) => {
     if (!gameLoopInterval) {
       startGameLoop()
     }
+
+    // Broadcast game start
+    io.emit("game-started", { player1Name, player2Name })
   })
 
-  // Manual Arduino control via WebSocket
+  // Manual Arduino control via WebSocket (for testing)
   socket.on("arduino-manual-press", (direction) => {
-    if (arduinoSimulator) {
-      arduinoSimulator.manualPress(direction)
+    console.log("🔘 Manual Arduino press:", direction)
+
+    const input = { up: false, down: false, left: false, right: false }
+
+    switch (direction.toUpperCase()) {
+      case "UP":
+        input.up = true
+        break
+      case "DOWN":
+        input.down = true
+        break
+      case "LEFT":
+        input.left = true
+        break
+      case "RIGHT":
+        input.right = true
+        break
     }
+
+    // Update player 1 and broadcast
+    updatePlayerDirection(gameState.player1, input)
+    io.emit("arduino-input", input)
+    io.emit("game-update", gameState)
   })
 
+  // Handle disconnect
   socket.on("disconnect", () => {
-    console.log("👤 Client disconnected")
+    if (socket.isBridge) {
+      console.log("🌉 Arduino Bridge disconnected:", socket.id)
+      connectedBridges.delete(socket.id)
+
+      if (connectedBridges.size === 0) {
+        arduinoConnected = false
+      }
+
+      // Notify all clients
+      io.emit("arduino-status", {
+        connected: connectedBridges.size > 0,
+        bridge: connectedBridges.size > 0,
+        bridges: connectedBridges.size,
+      })
+    } else {
+      console.log("👤 Client disconnected:", socket.id)
+    }
   })
 })
 
@@ -483,6 +224,10 @@ function updatePlayerDirection(player, input) {
 let gameLoopInterval = null
 
 function startGameLoop() {
+  if (gameLoopInterval) {
+    clearInterval(gameLoopInterval)
+  }
+
   gameLoopInterval = setInterval(() => {
     // Update invulnerability timers
     updateInvulnerability()
@@ -524,13 +269,11 @@ function updateInvulnerability() {
   // Player 1 invulnerability
   if (gameState.player1.invulnerable && currentTime - gameState.player1.invulnerableTime > 3000) {
     gameState.player1.invulnerable = false
-    console.log("🛡️ Player 1 is no longer invulnerable")
   }
 
   // Player 2 invulnerability
   if (gameState.player2.invulnerable && currentTime - gameState.player2.invulnerableTime > 3000) {
     gameState.player2.invulnerable = false
-    console.log("🛡️ Player 2 is no longer invulnerable")
   }
 }
 
@@ -539,14 +282,11 @@ function updatePowerMode() {
   if (gameState.powerMode) {
     const currentTime = Date.now()
     if (currentTime - gameState.powerModeTime > 10000) {
-      // Power mode lasts 10 seconds
       gameState.powerMode = false
-      console.log("⚡ Power mode ended")
 
       // Reset ghost colors
       gameState.ghosts.forEach((ghost) => {
         if (ghost.color === "blue") {
-          // Restore original colors
           if (ghost.originalColor) {
             ghost.color = ghost.originalColor
             delete ghost.originalColor
@@ -847,7 +587,6 @@ function checkCollisions() {
       // Activate power mode
       gameState.powerMode = true
       gameState.powerModeTime = Date.now()
-      console.log("⚡ Power mode activated!")
 
       // Turn ghosts blue
       gameState.ghosts.forEach((ghost) => {
@@ -862,14 +601,13 @@ function checkCollisions() {
     return true // Keep power pellet
   })
 
-  // Check ghost collisions - IMPROVED SYSTEM
+  // Check ghost collisions
   gameState.ghosts.forEach((ghost, ghostIndex) => {
     // Check collision with player 1
     if (ghost.x === gameState.player1.x && ghost.y === gameState.player1.y) {
       if (gameState.powerMode) {
         // Player can eat ghost during power mode
         gameState.player1.score += 200
-        console.log(`👻 Player 1 ate a ${ghost.originalColor || ghost.color} ghost! +200 points`)
 
         // Respawn ghost at center
         ghost.x = 13 + (ghostIndex % 2)
@@ -886,17 +624,10 @@ function checkCollisions() {
         gameState.player1.invulnerable = true
         gameState.player1.invulnerableTime = Date.now()
 
-        console.log(`💀 Player 1 was killed by ${ghost.color} ghost! Lives remaining: ${gameState.player1.lives}`)
-
         // Respawn player at starting position
         gameState.player1.x = 1
         gameState.player1.y = 1
         gameState.player1.direction = "right"
-
-        // Check if player is dead
-        if (gameState.player1.lives <= 0) {
-          console.log("💀 Player 1 is DEAD!")
-        }
       }
     }
 
@@ -905,7 +636,6 @@ function checkCollisions() {
       if (gameState.powerMode) {
         // Player can eat ghost during power mode
         gameState.player2.score += 200
-        console.log(`👻 Player 2 ate a ${ghost.originalColor || ghost.color} ghost! +200 points`)
 
         // Respawn ghost at center
         ghost.x = 13 + (ghostIndex % 2)
@@ -922,17 +652,10 @@ function checkCollisions() {
         gameState.player2.invulnerable = true
         gameState.player2.invulnerableTime = Date.now()
 
-        console.log(`💀 Player 2 was killed by ${ghost.color} ghost! Lives remaining: ${gameState.player2.lives}`)
-
         // Respawn player at starting position
         gameState.player2.x = 26
         gameState.player2.y = 1
         gameState.player2.direction = "left"
-
-        // Check if player is dead
-        if (gameState.player2.lives <= 0) {
-          console.log("💀 Player 2 is DEAD!")
-        }
       }
     }
   })
@@ -950,7 +673,6 @@ function checkGameOver() {
     } else {
       gameState.winner = null // Tie
     }
-    console.log("🎉 All dots collected! Game Over!")
   }
 
   // Check if both players are dead
@@ -963,24 +685,26 @@ function checkGameOver() {
     } else {
       gameState.winner = null // Tie
     }
-    console.log("💀 Both players are dead! Game Over!")
   }
 
   // Check if one player is dead (the other wins)
   if (gameState.player1.lives <= 0 && gameState.player2.lives > 0) {
     gameState.gameOver = true
     gameState.winner = gameState.player2.name || "Player 2"
-    console.log("🏆 Player 2 wins! Player 1 is dead!")
   } else if (gameState.player2.lives <= 0 && gameState.player1.lives > 0) {
     gameState.gameOver = true
     gameState.winner = gameState.player1.name || "Player 1"
-    console.log("🏆 Player 1 wins! Player 2 is dead!")
   }
 }
 
 // Save scores to database
 async function saveScores() {
   try {
+    if (!mongoose.connection.readyState) {
+      console.log("⚠️ Database not connected, skipping score save")
+      return
+    }
+
     const Score = require("./models/Score")
 
     // Save player 1 score
@@ -1009,21 +733,48 @@ async function saveScores() {
   }
 }
 
-// Catch all handler for React Router in production
-if (process.env.NODE_ENV === "production") {
-  app.get("*", (req, res) => {
-    res.sendFile(path.join(__dirname, "../front/dist/index.html"))
+// API endpoint for manual Arduino control (useful for testing)
+app.post("/api/arduino/press", (req, res) => {
+  const { direction } = req.body
+
+  if (!direction || !["UP", "DOWN", "LEFT", "RIGHT"].includes(direction.toUpperCase())) {
+    return res.status(400).json({ error: "Invalid direction. Use UP, DOWN, LEFT, or RIGHT" })
+  }
+
+  const input = { up: false, down: false, left: false, right: false }
+
+  switch (direction.toUpperCase()) {
+    case "UP":
+      input.up = true
+      break
+    case "DOWN":
+      input.down = true
+      break
+    case "LEFT":
+      input.left = true
+      break
+    case "RIGHT":
+      input.right = true
+      break
+  }
+
+  // Update player 1 and broadcast
+  updatePlayerDirection(gameState.player1, input)
+  io.emit("arduino-input", input)
+  io.emit("game-update", gameState)
+
+  res.json({ success: true, message: `Button ${direction} pressed`, input })
+})
+
+// Export for Vercel
+module.exports = app
+
+// Start server (only if not in Vercel)
+if (process.env.NODE_ENV !== "production") {
+  const PORT = process.env.PORT || 3001
+  server.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`)
+    console.log(`🎮 Pac-Man Multiplayer Game Server`)
+    console.log(`📡 WebSocket server ready`)
   })
 }
-
-// Start server
-const PORT = process.env.PORT || 3001
-server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`)
-  console.log(`🎮 Pac-Man Multiplayer Game Server`)
-  console.log(`📡 WebSocket server ready`)
-  console.log(`🔌 Arduino port: ${process.env.ARDUINO_PORT || "auto-detect"}`)
-
-  // Try to connect to Arduino after server starts
-  setTimeout(connectToArduino, 2000)
-})
